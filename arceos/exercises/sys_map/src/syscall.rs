@@ -1,13 +1,15 @@
 #![allow(dead_code)]
 
-use core::ffi::{c_void, c_char, c_int};
-use axhal::arch::TrapFrame;
-use axhal::trap::{register_trap_handler, SYSCALL};
-use axerrno::LinuxError;
-use axtask::current;
-use axtask::TaskExtRef;
-use axhal::paging::MappingFlags;
+use alloc::vec::Vec;
+use core::ffi::{c_char, c_int, c_void};
+
 use arceos_posix_api as api;
+use axerrno::{LinuxError, LinuxResult};
+use axhal::arch::TrapFrame;
+use axhal::paging::MappingFlags;
+use axhal::trap::{register_trap_handler, SYSCALL};
+use axtask::{current, TaskExtRef};
+use memory_addr::{MemoryAddr, VirtAddr, VirtAddrRange, PAGE_SIZE_4K};
 
 const SYS_IOCTL: usize = 29;
 const SYS_OPENAT: usize = 56;
@@ -131,16 +133,95 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
     ret
 }
 
-#[allow(unused_variables)]
 fn sys_mmap(
     addr: *mut usize,
     length: usize,
     prot: i32,
     flags: i32,
     fd: i32,
-    _offset: isize,
+    offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    syscall_body!(sys_mmap, {
+        if length == 0 || offset < 0 || offset as usize % PAGE_SIZE_4K != 0 {
+            return Err(LinuxError::EINVAL);
+        }
+        let size = length
+            .checked_add(PAGE_SIZE_4K - 1)
+            .ok_or(LinuxError::ENOMEM)?
+            & !(PAGE_SIZE_4K - 1);
+        let prot = MmapProt::from_bits(prot).ok_or(LinuxError::EINVAL)?;
+        let flags = MmapFlags::from_bits(flags).ok_or(LinuxError::EINVAL)?;
+        // This exercise implements private file mappings, without writeback or replacement.
+        if flags.bits() != MmapFlags::MAP_PRIVATE.bits() || prot.is_empty() {
+            return Err(LinuxError::EOPNOTSUPP);
+        }
+
+        let curr = current();
+        let mut aspace = curr.task_ext().aspace.lock();
+        // Keep the null page unmapped, even when the caller gives no hint.
+        let base = aspace.base().max(VirtAddr::from(PAGE_SIZE_4K));
+        let available = aspace.end() - base;
+        if size > available {
+            return Err(LinuxError::ENOMEM);
+        }
+        let range = VirtAddrRange::from_start_size(base, available);
+        let hint = VirtAddr::from(addr as usize).align_down_4k();
+        let hint = if range.contains(hint) { hint } else { base };
+        let start = aspace
+            .find_free_area(hint, size, range)
+            .or_else(|| aspace.find_free_area(base, size, range))
+            .ok_or(LinuxError::ENOMEM)?;
+        let data = read_mapping(fd, offset, length)?;
+
+        let mut permissions = MappingFlags::from(prot);
+        if permissions.contains(MappingFlags::WRITE) {
+            // RISC-V writable pages must also be readable.
+            permissions |= MappingFlags::READ;
+        }
+        aspace.map_alloc(start, size, permissions, true)?;
+        // The allocation backend zeroes pages, so bytes not read from the file stay zeroed.
+        if !data.is_empty() {
+            aspace.write(start, &data)?;
+        }
+        Ok(start.as_usize())
+    })
+}
+
+fn seek_file(fd: i32, offset: api::ctypes::off_t, whence: i32) -> LinuxResult<api::ctypes::off_t> {
+    let result = api::sys_lseek(fd, offset, whence);
+    if result < 0 {
+        Err(LinuxError::try_from(-result as i32).unwrap_or(LinuxError::EIO))
+    } else {
+        Ok(result)
+    }
+}
+
+fn read_mapping(fd: i32, offset: isize, length: usize) -> LinuxResult<Vec<u8>> {
+    const SEEK_SET: i32 = 0;
+    const SEEK_CUR: i32 = 1;
+
+    let file = api::get_file_like(fd)?;
+    // The POSIX API has no positioned read. Preserve the descriptor cursor for this one-task app.
+    let previous = seek_file(fd, 0, SEEK_CUR)?;
+    seek_file(fd, offset as _, SEEK_SET)?;
+    let data = (|| -> LinuxResult<_> {
+        let mut data = Vec::new();
+        let mut buffer = [0; PAGE_SIZE_4K];
+        while data.len() < length {
+            let count = buffer.len().min(length - data.len());
+            let count = file.read(&mut buffer[..count])?;
+            if count == 0 {
+                break;
+            }
+            data.try_reserve(count).map_err(|_| LinuxError::ENOMEM)?;
+            data.extend_from_slice(&buffer[..count]);
+        }
+        Ok(data)
+    })();
+    let restored = seek_file(fd, previous, SEEK_SET);
+    let data = data?;
+    restored?;
+    Ok(data)
 }
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {

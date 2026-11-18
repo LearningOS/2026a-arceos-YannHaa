@@ -165,7 +165,47 @@ impl VfsNodeOps for DirNode {
         }
     }
 
+    fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
+        let (src_parent, src) = split_parent(src_path)?;
+        let (dst_parent, dst) = split_parent(dst_path)?;
+        let this = self.this.upgrade().ok_or(VfsError::NotFound)?;
+        let src_parent = this.clone().lookup(src_parent)?;
+        let dst_parent = this.lookup(dst_parent)?;
+        if !Arc::ptr_eq(&src_parent, &dst_parent) {
+            return Err(VfsError::Unsupported);
+        }
+        let dir = src_parent
+            .as_any()
+            .downcast_ref::<DirNode>()
+            .ok_or(VfsError::NotADirectory)?;
+        let mut children = dir.children.write();
+        let node = children.get(src).ok_or(VfsError::NotFound)?;
+        if node.get_attr()?.is_dir() {
+            return Err(VfsError::IsADirectory);
+        }
+        if src != dst {
+            if let Some(target) = children.get(dst) {
+                if target.get_attr()?.is_dir() {
+                    return Err(VfsError::IsADirectory);
+                }
+            }
+            let node = children.remove(src).ok_or(VfsError::NotFound)?;
+            children.insert(dst.into(), node);
+        }
+        Ok(())
+    }
+
     axfs_vfs::impl_vfs_dir_default! {}
+}
+
+fn split_parent(path: &str) -> VfsResult<(&str, &str)> {
+    let path = path.trim_start_matches('/');
+    let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+    if matches!(name, "" | "." | "..") {
+        Err(VfsError::InvalidInput)
+    } else {
+        Ok((parent, name))
+    }
 }
 
 fn split_path(path: &str) -> (&str, Option<&str>) {

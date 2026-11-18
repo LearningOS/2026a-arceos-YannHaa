@@ -89,6 +89,30 @@ fn test_get_parent(devfs: &RamFileSystem) -> VfsResult {
 }
 
 #[test]
+fn test_rename_file() -> VfsResult {
+    let root = RamFileSystem::new().root_dir();
+    root.create("dir", VfsNodeType::Dir)?;
+    root.create("dir/old", VfsNodeType::File)?;
+    root.create("dir/new", VfsNodeType::File)?;
+    let old = root.clone().lookup("dir/old")?;
+    old.write_at(0, b"hello")?;
+    assert_eq!(root.rename("dir/old", "new"), Err(VfsError::Unsupported));
+    root.rename("dir/old", "dir/old")?;
+    root.rename("dir/old", "dir/./new")?;
+    let new = root.clone().lookup("dir/new")?;
+    assert!(Arc::ptr_eq(&old, &new));
+    assert_eq!(
+        root.clone().lookup("dir/old").err(),
+        Some(VfsError::NotFound)
+    );
+    assert_eq!(root.rename("dir/old", "dir/new"), Err(VfsError::NotFound));
+    let mut contents = [0; 5];
+    assert_eq!(new.read_at(0, &mut contents)?, contents.len());
+    assert_eq!(&contents, b"hello");
+    Ok(())
+}
+
+#[test]
 fn test_ramfs() {
     // .
     // ├── foo

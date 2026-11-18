@@ -86,8 +86,12 @@ impl RootDirectory {
         // Find the filesystem that has the longest mounted path match
         // TODO: more efficient, e.g. trie
         for (i, mp) in self.mounts.iter().enumerate() {
-            // skip the first '/'
-            if path.starts_with(&mp.path[1..]) && mp.path.len() - 1 > max_len {
+            let mount_path = &mp.path[1..];
+            if mount_path.len() > max_len
+                && path
+                    .strip_prefix(mount_path)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+            {
                 max_len = mp.path.len() - 1;
                 idx = i;
             }
@@ -133,12 +137,16 @@ impl VfsNodeOps for RootDirectory {
     }
 
     fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
-        self.lookup_mounted_fs(src_path, |fs, rest_path| {
-            if rest_path.is_empty() {
-                ax_err!(PermissionDenied) // cannot rename mount points
-            } else {
-                fs.root_dir().rename(rest_path, dst_path)
-            }
+        self.lookup_mounted_fs(src_path, |src_fs, src| {
+            self.lookup_mounted_fs(dst_path, |dst_fs, dst| {
+                if src.is_empty() || dst.is_empty() {
+                    ax_err!(PermissionDenied) // cannot rename mount points
+                } else if !Arc::ptr_eq(&src_fs, &dst_fs) {
+                    ax_err!(Unsupported) // cannot rename across filesystems
+                } else {
+                    src_fs.root_dir().rename(src, dst)
+                }
+            })
         })
     }
 }
@@ -302,9 +310,18 @@ pub(crate) fn set_current_dir(path: &str) -> AxResult {
 }
 
 pub(crate) fn rename(old: &str, new: &str) -> AxResult {
-    if parent_node_of(None, new).lookup(new).is_ok() {
-        warn!("dst file already exist, now remove it");
-        remove_file(None, new)?;
+    if old.is_empty() || new.is_empty() {
+        return ax_err!(NotFound);
     }
-    parent_node_of(None, old).rename(old, new)
+    let old_path = absolute_path(old)?;
+    let new_path = absolute_path(new)?;
+    // Some backends do not replace an existing entry themselves.
+    match ROOT_DIR.rename(&old_path, &new_path) {
+        Err(AxError::AlreadyExists) if old_path != new_path => {
+            lookup(None, old)?;
+            remove_file(None, new)?;
+            ROOT_DIR.rename(&old_path, &new_path)
+        }
+        result => result,
+    }
 }

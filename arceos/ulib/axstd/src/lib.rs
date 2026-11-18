@@ -55,7 +55,14 @@ extern crate alloc;
 
 #[cfg(feature = "alloc")]
 #[doc(no_inline)]
-pub use alloc::{boxed, collections, format, string, vec};
+pub use alloc::{boxed, format, string, vec};
+
+/// Standard collection types, including a hash table for `no_std` apps.
+#[cfg(feature = "alloc")]
+pub mod collections {
+    pub use alloc::collections::*;
+    pub use hashbrown::{hash_map, HashMap};
+}
 
 #[doc(no_inline)]
 pub use core::{arch, cell, cmp, hint, marker, mem, ops, ptr, slice, str};
